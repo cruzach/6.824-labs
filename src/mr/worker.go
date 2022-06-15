@@ -1,10 +1,19 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+)
 
+const TaskInterval = 200
 
 //
 // Map functions return a slice of KeyValue.
@@ -28,37 +37,162 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	n, succ := getReduceCount()
+	if succ == false {
+		fmt.Println("Failed to get reduce task count, worker exiting.")
+		return
+	}
+	nReduce := n
+	for {
+		task := getTask()
+		
+		switch task.Type {
+		case NoTask:
+			break
+		case ExitTask:
+			return
+		case MapTask:
+			performMapTask(task, nReduce, mapf)
+		case ReduceTask:
+			performReduceTask(task, reducef)
+		}
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+		time.Sleep(time.Millisecond * TaskInterval)
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func performMapTask(task Task, reduceCount int, mapf func(string, string) []KeyValue) {
+	// Read the task file given to us by the coordinator
+	file, err := os.Open(task.File)
+	if err != nil {
+		log.Fatalf("cannot open %v", task.File)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", task.File)
+	}
+	file.Close()
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	// Apply the map function
+	kva := mapf(task.File, string(content))
 
-	// fill in the argument(s).
-	args.X = 99
+	// Write key-value to each of the nReduce (given by coordinator) files. Which file? Use ihash(key) % nReduce to get a digit between 0 & (nReduce-1)
+	files := make([]*os.File, 0, reduceCount)
+	encoders := make([]*json.Encoder, 0, reduceCount)
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	for i := 0; i < reduceCount; i++ {
+		filePath := fmt.Sprintf("temp-mr-%v-%v", task.Index, i)
+		file, err := os.Create(filePath)
+		if err != nil {
+			log.Fatalf("cannot create file %v", filePath)
+		}
+		files = append(files, file)
+		encoders = append(encoders, json.NewEncoder(file))
+	}
+	for _, kv := range kva {
+		key := ihash(kv.Key) % reduceCount
+		err := encoders[key].Encode(&kv)
+		if err != nil {
+			log.Fatalf("cannot encode key, value %v, %v", kv.Key, kv.Value)
+		}
+	}
 
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
+	/*
+		To ensure that nobody observes partially written files in the presence of crashes, the MapReduce paper mentions the trick of using a temporary file and atomically renaming it once it is completely written.
+	*/
+	for i, file := range files {
+		file.Close()
+		newPath := fmt.Sprintf("mr-%v-%v", task.Index, i)
+		err := os.Rename(file.Name(), newPath)
+		if err != nil {
+			log.Fatalf("Cannot rename file %v", file.Name())
+		}
+	}
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	completeMapTask(task)
+}
+
+func performReduceTask(task Task, reducef func(string, []string) string) {
+	// Get all intermediate file paths. We know the format bc we wrote them in performMapTask
+	filepaths, err := filepath.Glob(fmt.Sprintf("mr-%v-%v", "*", task.Index))
+	if err != nil {
+		log.Fatalf("cannot glob")
+	}
+
+	// Reconstruct the key-value map
+	kvMap := make(map[string][]string)
+	for _,filepath := range filepaths {
+		file, err := os.Open(filepath)
+		if err != nil {
+			log.Fatalf("cannot open %v", task.File)
+		}
+
+		dec := json.NewDecoder(file)
+		
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+	}
+	
+	// Sort our keys
+	keys := make([]string, 0, len(kvMap))
+	for k := range kvMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Apply the reduce function
+	filePath := fmt.Sprintf("temp-mr-out-%v", task.Index)
+	file, err := os.Create(filePath)
+	if err != nil {
+		log.Fatalf("cannot create file %v", filePath)
+	}
+	for _,key := range keys {
+		output := reducef(key, kvMap[key])
+		_, err := fmt.Fprintf(file, "%v %v\n", key, output)
+		if err != nil {
+			log.Fatalf("cannot write to file %v", file)
+		}	
+	}
+
+	// Rename the file to atomically write like we did in performMapTask
+	file.Close()
+	newPath := fmt.Sprintf("mr-out-%v", task.Index)
+	err = os.Rename(filePath, newPath)
+	if err != nil {
+		log.Fatalf("Cannot rename file %v", filePath)
+	}
+	
+	completeReduceTask(task)
+}
+
+func getTask() Task {
+	args := GetTaskArgs{}
+	reply := Task{}
+	call("Coordinator.GetNextTask", &args, &reply)
+	return reply
+}
+
+func completeMapTask(task Task) {
+	reply := CompleteTaskReply{}
+	call("Coordinator.CompleteMapTask", &task, &reply)
+}
+
+func getReduceCount() (int, bool) {
+	args := GetReduceCountArgs{}
+	reply := GetReduceCountReply{}
+	succ := call("Coordinator.GetReduceCount", &args, &reply)
+	return reply.ReduceCount, succ
+}
+
+func completeReduceTask(task Task) {
+	reply := CompleteTaskReply{}
+	call("Coordinator.CompleteReduceTask", &task, &reply)
 }
 
 //
